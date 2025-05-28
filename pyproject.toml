@@ -1,0 +1,17 @@
+[tool.poetry]
+name = "volume-bot"
+version = "0.1.0"
+description = ""
+authors = ["TomasJuhos <tomas.juhos@2iqresearch.com>"]
+readme = "README.md"
+
+[tool.poetry.dependencies]
+python = "^3.10"
+pyyaml = "^6.0.2"
+aiohttp = "^3.12.2"
+pandas = "^2.2.3"
+
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
