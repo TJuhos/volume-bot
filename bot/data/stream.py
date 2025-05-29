@@ -47,7 +47,6 @@ class CombinedStream:
         try:
             while True:
                 diff = await diff_q.get()
-                print('Received diff')
 
                 # 1️⃣ Skip stale messages
                 if diff["u"] <= last_update_id:

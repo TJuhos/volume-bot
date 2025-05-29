@@ -7,6 +7,7 @@ from datetime import datetime
 import hmac
 import json
 import time
+import urllib.parse
 from base64 import b64encode
 from hashlib import sha256
 from typing import Any, AsyncGenerator, Dict, Optional
@@ -31,13 +32,68 @@ class BinanceConnector(BaseConnector):
 
     def __init__(self, config: Dict[str, Any], logger):
         super().__init__(config, logger)
-        self._api_key = config["api_key"]
-        self._api_secret = config["api_secret"].encode()
+        # Clean and validate API key
+        self._api_key = config["api_key"].strip()
+        if not self._api_key or len(self._api_key) < 10:
+            raise ValueError("Invalid API key: too short or empty")
+        if any(c.isspace() for c in self._api_key):
+            raise ValueError("Invalid API key: contains whitespace")
+            
+        # Clean and validate API secret
+        self._api_secret = config["api_secret"].strip()
+        if not self._api_secret or len(self._api_secret) < 10:
+            raise ValueError("Invalid API secret: too short or empty")
+        if any(c.isspace() for c in self._api_secret):
+            raise ValueError("Invalid API secret: contains whitespace")
+            
         self._base_url = config["base_url"].rstrip("/")
         self._ws_url = config["ws_url"].rstrip("/")
         self._session: Optional[aiohttp.ClientSession] = None
         self._listen_key: Optional[str] = None
         self._user_stream_task: Optional[asyncio.Task] = None
+        
+        # Debug logging for API key format
+        self.logger.debug("Initializing BinanceConnector")
+        self.logger.debug("API key length: %d", len(self._api_key))
+        self.logger.debug("API key first/last 4 chars: %s...%s", 
+                         self._api_key[:4], 
+                         self._api_key[-4:] if len(self._api_key) > 8 else "")
+        self.logger.debug("Base URL: %s", self._base_url)
+
+    def _generate_signature(self, params: Dict[str, Any]) -> str:
+        """Generate signature according to Binance API documentation.
+        
+        Args:
+            params: Dictionary of parameters to sign
+            
+        Returns:
+            HMAC SHA256 signature as hex string
+        """
+        # Create query string using urlencode
+        query_string = urllib.parse.urlencode(params)
+        self.logger.debug("Query string for signing: %s", query_string)
+        
+        # Generate signature using the raw API secret
+        signature = hmac.new(
+            self._api_secret.encode('utf-8'),
+            query_string.encode('utf-8'),
+            sha256
+        ).hexdigest()
+        
+        self.logger.debug("Generated signature: %s", signature)
+        return signature
+
+    async def _get_server_time(self) -> int:
+        """Get server time from Binance."""
+        if self._session is None:
+            self._session = aiohttp.ClientSession(json_serialize=json.dumps)
+            
+        async with self._session.get(f"{self._base_url}/v3/time") as resp:
+            if resp.status != 200:
+                text = await resp.text()
+                raise RuntimeError(f"Failed to get server time: {text}")
+            data = await resp.json()
+            return data["serverTime"]
 
     # ------------------- REST helpers ------------------- #
 
@@ -46,19 +102,37 @@ class BinanceConnector(BaseConnector):
             self._session = aiohttp.ClientSession(json_serialize=json.dumps)
 
         url = self._base_url + path
-        headers = {"X-MBX-APIKEY": self._api_key} if requires_auth else {}
-        signed_params = params or {}
+        headers = {}
+        request_params = params or {}
 
         if requires_auth:
-            signed_params["timestamp"] = int(time.time() * 1000)
-            # Create query string for signing
-            query_string = "&".join([f"{k}={v}" for k, v in sorted(signed_params.items())])
-            signature = hmac.new(self._api_secret, query_string.encode(), sha256).hexdigest()
-            signed_params["signature"] = signature
+            # Add API key to headers
+            headers["X-MBX-APIKEY"] = self._api_key
+            
+            # Add server timestamp
+            request_params["timestamp"] = await self._get_server_time()
+            
+            # Generate signature
+            signature = self._generate_signature(request_params)
+            request_params["signature"] = signature
 
-        async with self._session.request(method, url, params=signed_params, headers=headers) as resp:
+            # Debug logging
+            self.logger.debug("Making authenticated request to %s", url)
+            self.logger.debug("Request parameters: %s", request_params)
+            self.logger.debug("Request headers: %s", headers)
+
+        async with self._session.request(
+            method, 
+            url, 
+            params=request_params,  # Always send as query parameters
+            headers=headers
+        ) as resp:
             if resp.status != 200:
                 text = await resp.text()
+                self.logger.error("Request failed: %s %s", resp.status, text)
+                self.logger.error("Request details - URL: %s, Method: %s", url, method)
+                self.logger.error("Request params: %s", request_params)
+                self.logger.error("Request headers: %s", headers)
                 raise RuntimeError(f"Binance API error {resp.status}: {text}")
             return await resp.json()
 
@@ -108,9 +182,18 @@ class BinanceConnector(BaseConnector):
 
     async def _ensure_listen_key(self):
         if self._listen_key is None:
-            res = await self._rest("POST", f"{_BINA_BASE_PATH}/userDataStream", requires_auth=False)
-            self._listen_key = res["listenKey"]
-            self.logger.debug("Obtained listenKey %s", self._listen_key)
+            # Debug logging for user data stream request
+            self.logger.debug("Getting listen key with API key: %s", self._api_key)
+            # The user data stream endpoint requires the API key but not a signature
+            headers = {"X-MBX-APIKEY": self._api_key}
+            async with self._session.post(f"{self._base_url}{_BINA_BASE_PATH}/userDataStream", headers=headers) as resp:
+                if resp.status != 200:
+                    text = await resp.text()
+                    self.logger.error("Failed to get listen key: %s", text)
+                    raise RuntimeError(f"Failed to get listen key: {text}")
+                res = await resp.json()
+                self._listen_key = res["listenKey"]
+                self.logger.debug("Obtained listenKey %s", self._listen_key)
 
     async def place_limit_order(
         self,
@@ -127,19 +210,29 @@ class BinanceConnector(BaseConnector):
             "price": f"{price:.8f}",
             "quantity": f"{size:.8f}",
             "newClientOrderId": client_order_id,
-            "timeInForce": "GTC",
         }
         data = await self._rest("POST", f"{_BINA_BASE_PATH}/order", params, requires_auth=True)
-        return Order(
-            client_order_id=data["clientOrderId"],
-            exchange_order_id=data["orderId"],
-            symbol=data["symbol"],
-            side=data["side"],
-            price=float(data["price"]),
-            size=float(data["origQty"]),
-            status=data["status"],
-            timestamp=datetime.utcfromtimestamp(data["transactTime"] / 1000),
-        )
+        
+        # Debug log the response
+        self.logger.debug("Order placement response: %s", data)
+        
+        try:
+            # For LIMIT_MAKER orders, some fields are only present after the order is filled
+            # We'll use the input parameters for the missing fields
+            return Order(
+                client_order_id=data["clientOrderId"],
+                exchange_order_id=data["orderId"],
+                symbol=data["symbol"],
+                side=side.upper(),  # Use the input parameter
+                price=price,        # Use the input parameter
+                size=size,          # Use the input parameter
+                status="NEW",       # Initial status for a new order
+                timestamp=datetime.utcfromtimestamp(data["transactTime"] / 1000),
+            )
+        except KeyError as e:
+            self.logger.error("Missing field in order response: %s", e)
+            self.logger.error("Full response data: %s", data)
+            raise RuntimeError(f"Invalid order response from Binance: missing field {e}")
 
     async def cancel_order(self, symbol: str, client_order_id: str) -> None:
         params = {

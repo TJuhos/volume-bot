@@ -1,4 +1,4 @@
-"""Opinionated coloured stdout + optional rotating‑file logger."""
+"""Opinionated coloured stdout + optional rotating-file logger."""
 
 from __future__ import annotations
 
@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional
 
 
-COL_FMT = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+COL_FMT = "%(asctime)s | %(levelname)-8s | %(filename)s:%(lineno)d: %(message)s"
 DATE_FMT = "%Y‑%m‑%d %H:%M:%S"
 
 
