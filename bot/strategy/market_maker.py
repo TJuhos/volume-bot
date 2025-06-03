@@ -25,7 +25,7 @@ class MarketMakerStrategy:
 
     # ---- public API ---- #
 
-    def quote(self, ob: OrderBook) -> Tuple[QuoteBand, float, float]:
+    async def quote(self, ob: OrderBook) -> Tuple[QuoteBand, float, float]:
         """Return (QuoteBand, bid_size, ask_size)."""
         mid = ob.mid_price
         if mid == 0.0:
@@ -44,4 +44,22 @@ class MarketMakerStrategy:
         size = self._cfg.order_size
         bid_size = size if self._inv.position > -self._inv.max_position else 0.0
         ask_size = size if self._inv.position < self._inv.max_position else 0.0
+
         return band, bid_size, ask_size
+
+    def _round_price(self, price: float) -> float:
+        """Round price to meet exchange precision requirements."""
+        if self._price_precision is None:
+            return price  # Return as is if precision not yet known
+        return round(price, self._price_precision)
+
+    async def _get_symbol_info(self, symbol: str) -> None:
+        """Get symbol info from exchange if not already cached."""
+        if self._symbol_info is None:
+            self._symbol_info = await self._c.get_symbol_info(symbol)
+            # Extract price and quantity precision from filters
+            for f in self._symbol_info["filters"]:
+                if f["filterType"] == "PRICE_FILTER":
+                    self._price_precision = len(str(float(f["tickSize"])).split(".")[-1].rstrip("0"))
+                elif f["filterType"] == "LOT_SIZE":
+                    self._quantity_precision = len(str(float(f["stepSize"])).split(".")[-1].rstrip("0"))

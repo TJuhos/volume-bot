@@ -10,7 +10,7 @@ import time
 import urllib.parse
 from base64 import b64encode
 from hashlib import sha256
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, Optional, List
 
 import aiohttp
 
@@ -138,6 +138,18 @@ class BinanceConnector(BaseConnector):
 
     # ------------------- Market‑data ------------------- #
 
+    async def get_symbol_info(self, symbol: str) -> Dict[str, Any]:
+        """Get symbol information including filters and precision."""
+        path = f"{_BINA_BASE_PATH}/exchangeInfo"
+        data = await self._rest("GET", path, requires_auth=False)
+        
+        # Find the specific symbol info
+        for s in data["symbols"]:
+            if s["symbol"] == symbol.upper():
+                return s
+                
+        raise ValueError(f"Symbol {symbol} not found in exchange info")
+
     async def get_order_book_snapshot(self, symbol: str) -> OrderBookSnapshot:
         path = f"{_BINA_BASE_PATH}/depth"
         data = await self._rest("GET", path, {"symbol": symbol.upper(), "limit": 1000}, requires_auth=False)
@@ -206,7 +218,8 @@ class BinanceConnector(BaseConnector):
         params = {
             "symbol": symbol.upper(),
             "side": side.upper(),
-            "type": "LIMIT_MAKER",
+            "type": "LIMIT",
+            "timeInForce": "GTC",
             "price": f"{price:.8f}",
             "quantity": f"{size:.8f}",
             "newClientOrderId": client_order_id,
@@ -217,16 +230,14 @@ class BinanceConnector(BaseConnector):
         self.logger.debug("Order placement response: %s", data)
         
         try:
-            # For LIMIT_MAKER orders, some fields are only present after the order is filled
-            # We'll use the input parameters for the missing fields
             return Order(
                 client_order_id=data["clientOrderId"],
                 exchange_order_id=data["orderId"],
                 symbol=data["symbol"],
-                side=side.upper(),  # Use the input parameter
-                price=price,        # Use the input parameter
-                size=size,          # Use the input parameter
-                status="NEW",       # Initial status for a new order
+                side=side.upper(),
+                price=price,
+                size=size,
+                status="NEW",
                 timestamp=datetime.utcfromtimestamp(data["transactTime"] / 1000),
             )
         except KeyError as e:
@@ -243,15 +254,66 @@ class BinanceConnector(BaseConnector):
 
     async def stream_user_events(self) -> AsyncGenerator[dict, None]:
         await self._ensure_listen_key()
-        url = f"{self._ws_url}/stream?streams={self._listen_key}"
+        # Ensure ws_url doesn't end with /ws
+        ws_base = self._ws_url.rstrip("/ws").rstrip("/")
+        url = f"{ws_base}/stream?streams={self._listen_key}"
+        self.logger.debug("Connecting to user data stream at: %s", url)
+        
         async with aiohttp.ClientSession() as session:
-            async with session.ws_connect(url, heartbeat=20) as ws:
-                async for msg in ws:
-                    if msg.type == aiohttp.WSMsgType.TEXT:
-                        data = json.loads(msg.data)
-                        yield data["data"]
-                    elif msg.type == aiohttp.WSMsgType.ERROR:
-                        break
+            try:
+                async with session.ws_connect(url, heartbeat=20) as ws:
+                    self.logger.info("Successfully connected to user data stream")
+                    async for msg in ws:
+                        if msg.type == aiohttp.WSMsgType.TEXT:
+                            data = json.loads(msg.data)
+                            yield data["data"]
+                        elif msg.type == aiohttp.WSMsgType.ERROR:
+                            self.logger.error("WebSocket error: %s", msg.data)
+                            break
+            except Exception as e:
+                self.logger.error("Failed to connect to user data stream: %s", e)
+                raise
+
+    async def get_order_status(self, symbol: str, client_order_id: str) -> Optional[Order]:
+        """Get the current status of an order from the exchange."""
+        params = {
+            "symbol": symbol.upper(),
+            "origClientOrderId": client_order_id,
+        }
+        try:
+            data = await self._rest("GET", f"{_BINA_BASE_PATH}/order", params, requires_auth=True)
+            return Order(
+                client_order_id=data["clientOrderId"],
+                exchange_order_id=data["orderId"],
+                symbol=data["symbol"],
+                side=data["side"],
+                price=float(data["price"]),
+                size=float(data["origQty"]),
+                status=data["status"],
+                timestamp=datetime.utcfromtimestamp(data["time"] / 1000),
+            )
+        except Exception as e:
+            if "Unknown order" in str(e):
+                return None
+            raise
+
+    async def get_open_orders(self, symbol: str) -> List[Order]:
+        """Get all open orders for a symbol."""
+        params = {"symbol": symbol.upper()}
+        data = await self._rest("GET", f"{_BINA_BASE_PATH}/openOrders", params, requires_auth=True)
+        return [
+            Order(
+                client_order_id=order["clientOrderId"],
+                exchange_order_id=order["orderId"],
+                symbol=order["symbol"],
+                side=order["side"],
+                price=float(order["price"]),
+                size=float(order["origQty"]),
+                status=order["status"],
+                timestamp=datetime.utcfromtimestamp(order["time"] / 1000),
+            )
+            for order in data
+        ]
 
     # ------------------- Housekeeping ------------------- #
 
@@ -260,3 +322,7 @@ class BinanceConnector(BaseConnector):
             await self._session.close()
         if self._user_stream_task:
             self._user_stream_task.cancel()
+
+    async def get_account_info(self) -> dict:
+        """Get account information including balances."""
+        return await self._rest("GET", f"{_BINA_BASE_PATH}/account", requires_auth=True)
