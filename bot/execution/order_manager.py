@@ -64,14 +64,14 @@ class OrderManager:
         )
         self._strat = MarketMakerStrategy(mm_cfg, self._inv)
 
-        # Live orders keyed by client_id
+        # Order tracking
         self._live: Dict[str, LiveOrder] = {}
         self._id_seq = itertools.count(1)
-        self._order_lock = asyncio.Lock()  # Add lock for order operations
+        self._order_lock = asyncio.Lock()
 
         # Grid trading parameters
-        self._grid_spacing_bps = config["trading"]["grid_spacing_bps"]  # Distance from mid price in basis points
-        self._grid_size = config["trading"]["order_size"]  # Size per order
+        self._grid_spacing_bps = config["trading"]["grid_spacing_bps"]
+        self._grid_size = config["trading"]["order_size"]
         
         # Status reporting
         self._last_status_time = datetime.utcnow()
@@ -84,6 +84,8 @@ class OrderManager:
         
         # Latest orderbook state
         self._latest_ob: Optional[OrderBook] = None
+        self._last_ob_update: Optional[datetime] = None
+        self._ob_stale_threshold = timedelta(seconds=5)  # Consider orderbook stale after 5 seconds
         
         # Exchange info
         self._symbol_info = None
@@ -94,35 +96,402 @@ class OrderManager:
         self._pnl_stats: Optional[PnLStats] = None
 
     async def run(self) -> None:
+        """Main entry point for the order manager."""
         symbol = self._cfg["trading"]["symbol"].upper()
-        stream = CombinedStream(self._c, symbol)
-
-        # Get symbol info first
-        await self._get_symbol_info(symbol)
         
-        # Get initial balances
-        base_currency = symbol[:-4]  # e.g., BTC from BTCUSDT
-        quote_currency = symbol[-4:]  # e.g., USDT from BTCUSDT
+        # Initialize exchange info and balances
+        await self._initialize(symbol)
+        
+        # Start market data stream
+        stream = CombinedStream(self._c, symbol)
+        
+        # Wait for first valid orderbook
+        await self._wait_for_orderbook(stream)
+        
+        # Start user events handler
+        fills_task = asyncio.create_task(self._handle_user_events())
         
         try:
-            # Clean up any existing orders first
-            self._logger.info("Cleaning up any existing orders...")
+            # Main trading loop
+            async for ob_snapshot, trades in stream.stream():
+                await self._process_market_update(symbol, ob_snapshot, trades)
+                
+                # Check if fills task is still running
+                if fills_task.done():
+                    exc = fills_task.exception()
+                    if exc:
+                        self._logger.error("Fills task failed: %s", exc)
+                        raise exc
+                    else:
+                        self._logger.error("Fills task completed unexpectedly")
+                        raise RuntimeError("Fills task completed unexpectedly")
+        finally:
+            fills_task.cancel()
             try:
-                open_orders = await self._c.get_open_orders(symbol)
-                for order in open_orders:
-                    try:
-                        await self._c.cancel_order(symbol, order.client_order_id)
-                        self._logger.info("Cancelled existing order: %s", order.client_order_id)
-                    except Exception as e:
-                        if "Unknown order" not in str(e):
-                            self._logger.error("Error cancelling order %s: %s", order.client_order_id, e)
+                await fills_task
+            except asyncio.CancelledError:
+                pass
+
+    async def _initialize(self, symbol: str) -> None:
+        """Initialize exchange info and balances."""
+        # Get symbol info
+        await self._get_symbol_info(symbol)
+        
+        # Clean up existing orders
+        await self._cleanup_existing_orders(symbol)
+        
+        # Load initial balances
+        await self._load_initial_balances(symbol)
+
+    async def _wait_for_orderbook(self, stream: CombinedStream) -> None:
+        """Wait for first valid orderbook."""
+        self._logger.info("Waiting for first valid orderbook...")
+        async for ob_snapshot, _ in stream.stream():
+            self._latest_ob = OrderBook(ob_snapshot)
+            if self._latest_ob.best_bid and self._latest_ob.best_ask:
+                self._last_ob_update = ob_snapshot.timestamp
+                self._logger.info("Received first valid orderbook with timestamp: %s", self._last_ob_update)
+                break
+
+    async def _process_market_update(self, symbol: str, ob_snapshot: dict, trades: list) -> None:
+        """Process a market update from the stream."""
+        # Update latest orderbook state with timestamp from the snapshot
+        self._latest_ob = OrderBook(ob_snapshot)
+        self._last_ob_update = ob_snapshot.timestamp
+        
+        # Skip if we don't have a valid orderbook yet
+        if not self._latest_ob.best_bid or not self._latest_ob.best_ask:
+            self._logger.debug("Waiting for valid orderbook...")
+            return
+            
+        # Safety check - if we have no orders and valid orderbook, place new orders
+        if not self._live and not self._is_orderbook_stale():
+            self._logger.info("No live orders detected, placing new grid orders")
+            await self._place_grid_orders(symbol, self._latest_ob.mid_price)
+            return
+        
+        # Get strategy quotes
+        band, bid_size, ask_size = await self._strat.quote(self._latest_ob)
+        now = datetime.utcnow()
+        
+        # Report status periodically
+        if now - self._last_status_time >= self._status_interval:
+            await self._report_status(symbol, self._latest_ob)
+            self._report_fills()
+            self._last_status_time = now
+        
+        # Check if orders need to be cancelled due to price drift
+        await self._check_order_drift(symbol, band.bid, bid_size, band.ask, ask_size, now)
+
+    async def _handle_user_events(self) -> None:
+        """Handle user events stream (fills, cancels, etc)."""
+        self._logger.info("Starting user events stream handler")
+        
+        # Place initial orders if we don't have any
+        if not self._live and self._latest_ob:
+            await self._place_grid_orders(
+                self._cfg["trading"]["symbol"].upper(),
+                self._latest_ob.mid_price
+            )
+        
+        async for evt in self._c.stream_user_events():
+            try:
+                self._logger.debug("Received user event: %s", evt)
+                if evt.get("e") != "executionReport":
+                    continue
+                
+                # Log the full execution report
+                self._logger.debug(
+                    "Processing execution report:\n"
+                    f"  Order ID: {evt.get('c')}\n"
+                    f"  Status: {evt.get('X')}\n"
+                    f"  Side: {evt.get('S')}\n"
+                    f"  Price: {evt.get('p')}\n"
+                    f"  Quantity: {evt.get('q')}\n"
+                    f"  Filled: {evt.get('l')}\n"
+                    f"  Fill Price: {evt.get('L')}\n"
+                    f"  Symbol: {evt.get('s')}"
+                )
+                
+                await self._process_execution_report(evt)
             except Exception as e:
-                self._logger.error("Error getting open orders: %s", e)
+                self._logger.error("Error processing user event: %s", e, exc_info=True)
+
+    async def _process_execution_report(self, evt: dict) -> None:
+        """Process an execution report event."""
+        status = evt.get("X")
+        side = evt.get("S")
+        client_id = evt.get("c")
+        filled_qty = float(evt.get("l", 0))
+        filled_px = float(evt.get("L", 0))
+        symbol = evt.get("s")
+        
+        self._logger.debug(
+            "Processing execution report for order %s:\n"
+            f"  Status: {status}\n"
+            f"  Side: {side}\n"
+            f"  Filled Qty: {filled_qty}\n"
+            f"  Fill Price: {filled_px}\n"
+            f"  Symbol: {symbol}",
+            client_id
+        )
+        
+        if status in {"FILLED", "PARTIALLY_FILLED"} and filled_qty > 0:
+            await self._handle_fill(symbol, side, client_id, filled_qty, filled_px)
+        
+        # Drop from live map if the order is closed
+        if status in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
+            self._logger.info("Removing order %s from live orders (status: %s)", client_id, status)
+            self._live.pop(client_id, None)
+
+    async def _handle_fill(self, symbol: str, side: str, client_id: str, filled_qty: float, filled_px: float) -> None:
+        """Handle a fill event."""
+        self._logger.info(
+            "\n=== Fill ===\n"
+            f"{side} @ {filled_px:.2f}\n"
+            "==========="
+        )
+        
+        # Remove the filled order from live orders
+        self._live.pop(client_id, None)
+        
+        # Cancel the opposite side order if it exists
+        opposite_side = "SELL" if side == "BUY" else "BUY"
+        for order in list(self._live.values()):
+            if order.side == opposite_side:
+                self._logger.info("Cancelling opposite side order after fill")
+                await self._cancel_order_safe(symbol, order.client_id)
+        
+        # Update balances from exchange
+        await self._update_balances_from_exchange(symbol)
+        
+        # Record fill for statistics
+        self._fills.append(Fill(
+            side=side,
+            price=filled_px,
+            size=filled_qty,
+            timestamp=datetime.utcnow()
+        ))
+        
+        # Always try to place new orders after a fill
+        if not self._is_orderbook_stale() and self._latest_ob:
+            await self._place_grid_orders(symbol, self._latest_ob.mid_price)
+        else:
+            self._logger.warning(
+                "Orderbook is stale after fill (last update: %s), waiting for fresh data before placing new orders",
+                self._last_ob_update
+            )
+            # Start a task to wait for fresh data and place orders
+            asyncio.create_task(self._wait_and_place_orders(symbol))
+        
+        # Report fill statistics
+        self._report_fills()
+
+    async def _wait_and_place_orders(self, symbol: str) -> None:
+        """Wait for fresh orderbook data and place new orders."""
+        while self._is_orderbook_stale():
+            await asyncio.sleep(0.1)  # Wait for 100ms before checking again
             
-            # Clear our local order tracking
-            self._live.clear()
+        if self._latest_ob:
+            self._logger.info("Orderbook is fresh again, placing new orders")
+            await self._place_grid_orders(symbol, self._latest_ob.mid_price)
+
+    async def _check_order_drift(self, symbol: str, bid_px: float, bid_sz: float, ask_px: float, ask_sz: float, ts: datetime) -> None:
+        """Check if orders have drifted too far from mid price and cancel if needed."""
+        if not self._latest_ob:
+            return
+
+        mid_price = self._latest_ob.mid_price
+        
+        # Check if any existing orders are too far from mid price
+        orders_to_cancel = []
+        for order in list(self._live.values()):  # Create a copy to avoid modification during iteration
+            try:
+                # Verify order still exists on exchange
+                exchange_order = await self._c.get_order_status(symbol, order.client_id)
+                if exchange_order is None:
+                    self._logger.debug("Order %s not found on exchange during drift check, removing from local tracking", 
+                                     order.client_id)
+                    self._live.pop(order.client_id, None)
+                    continue
+                    
+                price_diff_bps = abs(order.price - mid_price) / mid_price * 10000
+                drift_threshold = self._grid_spacing_bps * 2.0  # Allow orders to drift up to 2x the grid spacing
+                self._logger.debug(
+                    "Checking order drift for %s order @ %.2f:\n"
+                    f"  Mid price: {mid_price:.2f}\n"
+                    f"  Price diff: {price_diff_bps:.1f} bps\n"
+                    f"  Threshold: {drift_threshold:.1f} bps",
+                    order.side, order.price
+                )
+                if price_diff_bps > drift_threshold:
+                    self._logger.info(
+                        "Order %s @ %.2f drifted too far from mid price %.2f (%.1f bps > %.1f bps threshold)",
+                        order.side, order.price, mid_price, price_diff_bps, drift_threshold
+                    )
+                    orders_to_cancel.append(order)
+            except Exception as e:
+                self._logger.error("Error checking order %s status: %s", order.client_id, e)
+                continue
+        
+        # Cancel orders that are too far from mid price
+        for order in orders_to_cancel:
+            await self._cancel_order_safe(symbol, order.client_id)
             
+        # If we cancelled any orders, place new ones if we have fresh data
+        if orders_to_cancel and not self._is_orderbook_stale() and self._latest_ob:
+            self._logger.info("Placing new orders after drift cancellation")
+            await self._place_grid_orders(symbol, self._latest_ob.mid_price)
+
+    async def _place_grid_orders(self, symbol: str, mid_price: float) -> None:
+        """Place a new pair of grid orders around the mid price."""
+        async with self._order_lock:
+            # Cancel any existing orders first
+            remaining_orders = list(self._live.values())
+            for order in remaining_orders:
+                await self._cancel_order_safe(symbol, order.client_id)
+
+            # Get current mid price from orderbook
+            if not self._latest_ob or not self._latest_ob.best_bid or not self._latest_ob.best_ask:
+                self._logger.warning("No valid orderbook data available, skipping order placement")
+                return
+
+            current_mid = self._latest_ob.mid_price
+            
+            # Calculate both prices upfront
+            buy_price = self._round_price(current_mid * (1 - self._grid_spacing_bps / 10000))
+            sell_price = self._round_price(current_mid * (1 + self._grid_spacing_bps / 10000))
+            
+            try:
+                # Place buy order
+                await self._place(symbol, "BUY", buy_price, self._grid_size)
+                
+                # Place sell order
+                await self._place(symbol, "SELL", sell_price, self._grid_size)
+                
+                # If we get here, both orders were placed successfully
+                self._logger.info(
+                    "\n=== New Orders ===\n"
+                    f"BUY  @ {buy_price:.2f}\n"
+                    f"SELL @ {sell_price:.2f}\n"
+                    f"(Mid: {current_mid:.2f})\n"
+                    "================"
+                )
+                
+            except Exception as e:
+                self._logger.error("Failed to place orders: %s", e)
+                # Cancel any orders that might have been placed
+                for order in list(self._live.values()):
+                    await self._cancel_order_safe(symbol, order.client_id)
+                
+                # Retry once after a short delay
+                await asyncio.sleep(0.5)
+                if self._latest_ob and self._latest_ob.best_bid and self._latest_ob.best_ask:
+                    await self._place_grid_orders(symbol, self._latest_ob.mid_price)
+
+    async def _cancel_order_safe(self, symbol: str, client_id: str) -> bool:
+        """Safely cancel an order, checking if it exists first."""
+        try:
+            # Check if order exists and is in a cancellable state
+            exchange_order = await self._c.get_order_status(symbol, client_id)
+            if exchange_order is None:
+                self._logger.debug("Order %s not found on exchange, removing from local tracking", client_id)
+                self._live.pop(client_id, None)
+                return True
+                
+            if exchange_order.status not in {"NEW", "PARTIALLY_FILLED"}:
+                self._logger.debug("Order %s is in non-cancellable state %s, removing from local tracking", 
+                                 client_id, exchange_order.status)
+                self._live.pop(client_id, None)
+                return True
+                
+            # Order exists and is cancellable, try to cancel it
+            await self._c.cancel_order(symbol, client_id)
+            self._live.pop(client_id, None)
+            return True
+            
+        except Exception as e:
+            if "Unknown order" in str(e):
+                self._logger.debug("Order %s not found on exchange (Unknown order), removing from local tracking", client_id)
+                self._live.pop(client_id, None)
+                return True
+            self._logger.error("Error cancelling order %s: %s", client_id, e)
+            return False
+
+    async def _place(self, symbol: str, side: str, price: float, size: float):
+        """Place an order, ensuring it's on the correct side of the mid price."""
+        if self._latest_ob is None or self._is_orderbook_stale():
+            self._logger.warning(
+                "No valid orderbook data available (last update: %s), skipping order placement",
+                self._last_ob_update
+            )
+            return
+            
+        mid_price = self._latest_ob.mid_price
+        
+        # Verify order is on correct side of mid price
+        if side == "BUY" and price >= mid_price:
+            self._logger.warning(
+                "Buy order price %.2f is above mid price %.2f, adjusting down",
+                price, mid_price
+            )
+            price = self._round_price(mid_price * (1 - self._grid_spacing_bps / 10000))
+        elif side == "SELL" and price <= mid_price:
+            self._logger.warning(
+                "Sell order price %.2f is below mid price %.2f, adjusting up",
+                price, mid_price
+            )
+            price = self._round_price(mid_price * (1 + self._grid_spacing_bps / 10000))
+            
+        client_id = f"volbot-{next(self._id_seq)}-{uuid.uuid4().hex[:8]}"
+        try:
+            self._logger.debug("Placing %s order %s @ %.2f", side, client_id, price)
+            order: Order = await self._c.place_limit_order(symbol, side, price, size, client_id)
+            
+            # Verify the order was actually placed
+            exchange_order = await self._c.get_order_status(symbol, client_id)
+            if exchange_order is None:
+                self._logger.error("Order %s not found on exchange after placement", client_id)
+                raise RuntimeError(f"Order {client_id} not found on exchange after placement")
+                
+            self._live[client_id] = LiveOrder(
+                client_id=client_id,
+                side=side,
+                price=order.price,
+                size=order.size,
+            )
+            
+            self._logger.info("Successfully placed %s order %s @ %.2f", side, client_id, price)
+            
+        except Exception as exc:
+            self._logger.error("Failed to place order: %s", exc)
+            raise
+
+    async def _cleanup_existing_orders(self, symbol: str) -> None:
+        """Clean up any existing orders on startup."""
+        self._logger.info("Cleaning up any existing orders...")
+        try:
+            open_orders = await self._c.get_open_orders(symbol)
+            for order in open_orders:
+                try:
+                    await self._c.cancel_order(symbol, order.client_order_id)
+                    self._logger.info("Cancelled existing order: %s", order.client_order_id)
+                except Exception as e:
+                    if "Unknown order" not in str(e):
+                        self._logger.error("Error cancelling order %s: %s", order.client_order_id, e)
+        except Exception as e:
+            self._logger.error("Error getting open orders: %s", e)
+        
+        # Clear our local order tracking
+        self._live.clear()
+
+    async def _load_initial_balances(self, symbol: str) -> None:
+        """Load initial balances from exchange."""
+        try:
             account_info = await self._c.get_account_info()
+            base_currency = symbol[:-4]  # e.g., BTC from BTCUSDT
+            quote_currency = symbol[-4:]  # e.g., USDT from BTCUSDT
+            
             base_balance = 0.0
             quote_balance = 0.0
             
@@ -141,119 +510,55 @@ class OrderManager:
             self._logger.error("Failed to load initial balances: %s", e)
             raise
 
-        # Wait for first valid orderbook
-        self._logger.info("Waiting for first valid orderbook...")
-        async for ob_snapshot, trades in stream.stream():
-            self._latest_ob = OrderBook(ob_snapshot)
-            if self._latest_ob.best_bid and self._latest_ob.best_ask:
-                break
-        
-        # Initialize PnL stats
-        self._pnl_stats = PnLStats(
-            initial_account_value=self._inv.get_account_value(self._latest_ob.mid_price),
-            initial_base_balance=base_balance,
-            initial_quote_balance=quote_balance,
-            initial_base_price=self._latest_ob.mid_price
-        )
-        
-        # Create event for initial order placement
-        initial_order_event = asyncio.Event()
-        
-        # Fan‑in user events (fills / cancels)
-        fills_task = asyncio.create_task(self._handle_fills(initial_order_event))
-        
-        try:
-            # Signal that we're ready to place initial orders
-            initial_order_event.set()
+    async def _get_symbol_info(self, symbol: str) -> None:
+        """Get symbol info from exchange if not already cached."""
+        if self._symbol_info is None:
+            self._symbol_info = await self._c.get_symbol_info(symbol)
+            # Extract price and quantity precision from filters
+            for f in self._symbol_info["filters"]:
+                if f["filterType"] == "PRICE_FILTER":
+                    self._price_precision = len(str(float(f["tickSize"])).split(".")[-1].rstrip("0"))
+                elif f["filterType"] == "LOT_SIZE":
+                    self._quantity_precision = len(str(float(f["stepSize"])).split(".")[-1].rstrip("0"))
             
-            async for ob_snapshot, trades in stream.stream():
-                # Update latest orderbook state
-                self._latest_ob = OrderBook(ob_snapshot)
-                
-                # Skip if we don't have a valid orderbook yet
-                if not self._latest_ob.best_bid or not self._latest_ob.best_ask:
-                    self._logger.debug("Waiting for valid orderbook...")
-                    continue
-                
-                band, bid_size, ask_size = await self._strat.quote(self._latest_ob)
-                now = datetime.utcnow()
-                
-                # Report status periodically
-                if now - self._last_status_time >= self._status_interval:
-                    await self._report_status(symbol, self._latest_ob)
-                    self._report_fills()  # Add fills report to status interval
-                    self._last_status_time = now
-                
-                # Only check for orders that need to be cancelled
-                await self._reconcile(symbol, band.bid, bid_size, band.ask, ask_size, now)
-                
-                # Check if fills task is still running
-                if fills_task.done():
-                    exc = fills_task.exception()
-                    if exc:
-                        self._logger.error("Fills task failed: %s", exc)
-                        raise exc
-                    else:
-                        self._logger.error("Fills task completed unexpectedly")
-                        raise RuntimeError("Fills task completed unexpectedly")
+            self._logger.info(
+                "Symbol info loaded - Price precision: %d, Quantity precision: %d",
+                self._price_precision, self._quantity_precision
+            )
 
+    def _round_price(self, price: float) -> float:
+        """Round price to meet exchange precision requirements."""
+        if self._price_precision is None:
+            return price  # Return as is if precision not yet known
+        return round(price, self._price_precision)
+
+    async def _update_balances_from_exchange(self, symbol: str) -> None:
+        """Fetch and update balances from the exchange."""
+        try:
+            account_info = await self._c.get_account_info()
+            base_currency = symbol[:-4]  # e.g., BTC from BTCUSDT
+            quote_currency = symbol[-4:]  # e.g., USDT from BTCUSDT
+            
+            base_balance = 0.0
+            quote_balance = 0.0
+            
+            for balance in account_info["balances"]:
+                if balance["asset"] == base_currency:
+                    base_balance = float(balance["free"])
+                elif balance["asset"] == quote_currency:
+                    quote_balance = float(balance["free"])
+            
+            self._inv.set_available_balance(base_balance, quote_balance)
+            self._logger.debug(
+                "Updated balances from exchange - Base: %.6f %s, Quote: %.2f %s",
+                base_balance, base_currency, quote_balance, quote_currency
+            )
         except Exception as e:
-            self._logger.error("Error in main loop: %s", e, exc_info=True)
+            self._logger.error("Failed to update balances from exchange: %s", e)
             raise
-        finally:
-            fills_task.cancel()
-            try:
-                await fills_task
-            except asyncio.CancelledError:
-                pass
-
-    async def _verify_orders(self, symbol: str) -> None:
-        """Verify that our tracked orders match the exchange state."""
-        # Create a copy of live orders to avoid modification during iteration
-        orders_to_verify = list(self._live.values())
-        orders_removed = False
-        
-        for order in orders_to_verify:
-            try:
-                exchange_order = await self._c.get_order_status(symbol, order.client_id)
-                if exchange_order is None:
-                    self._logger.warning(
-                        "Order %s not found on exchange, removing from tracking",
-                        order.client_id
-                    )
-                    self._live.pop(order.client_id, None)
-                    orders_removed = True
-                elif exchange_order.status in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
-                    self._logger.info(
-                        "Order %s is %s on exchange, removing from tracking",
-                        order.client_id, exchange_order.status
-                    )
-                    self._live.pop(order.client_id, None)
-                    orders_removed = True
-                    
-                    # If order was filled, record it
-                    if exchange_order.status == "FILLED":
-                        self._fills.append(Fill(
-                            side=order.side,
-                            price=order.price,
-                            size=order.size,
-                            timestamp=datetime.utcnow()
-                        ))
-                        # Update balances from exchange
-                        await self._update_balances_from_exchange(symbol)
-            except Exception as e:
-                self._logger.error("Error verifying order %s: %s", order.client_id, e)
-        
-        # If any orders were removed and we have a valid orderbook, place new orders
-        if orders_removed and self._latest_ob and len(self._live) < 2:
-            self._logger.info("Orders were removed, placing new grid orders...")
-            await self._place_grid_orders(symbol, self._latest_ob.mid_price)
 
     async def _report_status(self, symbol: str, ob: OrderBook) -> None:
         """Report current position, orders, and market state."""
-        # Verify orders with exchange
-        await self._verify_orders(symbol)
-        
         # Get current position
         position = self._inv.position
         position_value = position * ob.mid_price
@@ -263,15 +568,21 @@ class OrderManager:
         live_orders = []
         # Create a copy of live orders to iterate over
         orders_to_check = list(self._live.values())
+        self._logger.debug("Checking status of %d live orders", len(orders_to_check))
         for order in orders_to_check:
             try:
                 exchange_order = await self._c.get_order_status(symbol, order.client_id)
+                if exchange_order is None:
+                    self._logger.warning("Order %s not found on exchange, removing from live orders", order.client_id)
+                    self._live.pop(order.client_id, None)
+                    continue
+                    
                 age = (datetime.utcnow() - order.birth).total_seconds()
                 live_orders.append(
                     f"{order.side} @ {order.price:.2f} ({age:.1f}s)"
                 )
             except Exception as e:
-                self._logger.error("Error getting order status: %s", e)
+                self._logger.error("Error getting order status for %s: %s", order.client_id, e)
                 live_orders.append(
                     f"{order.side} @ {order.price:.2f} (ERROR)"
                 )
@@ -349,7 +660,7 @@ class OrderManager:
             price_return = ((self._latest_ob.mid_price - self._pnl_stats.initial_base_price) / self._pnl_stats.initial_base_price) * 100
             
             # Log fill report with both PnL metrics
-            self._logger.info(
+            self._logger.debug(
                 "\n=== Fill Report ===\n"
                 f"Total Fills: {total_fills}\n"
                 f"Buy Fills: {len(buy_fills)}\n"
@@ -364,7 +675,7 @@ class OrderManager:
             )
         else:
             # Log basic fill report if PnL stats not available
-            self._logger.info(
+            self._logger.debug(
                 "\n=== Fill Report ===\n"
                 f"Total Fills: {total_fills}\n"
                 f"Buy Fills: {len(buy_fills)}\n"
@@ -377,250 +688,8 @@ class OrderManager:
         
         self._last_fill_report = now
 
-    async def _get_symbol_info(self, symbol: str) -> None:
-        """Get symbol info from exchange if not already cached."""
-        if self._symbol_info is None:
-            self._symbol_info = await self._c.get_symbol_info(symbol)
-            # Extract price and quantity precision from filters
-            for f in self._symbol_info["filters"]:
-                if f["filterType"] == "PRICE_FILTER":
-                    self._price_precision = len(str(float(f["tickSize"])).split(".")[-1].rstrip("0"))
-                elif f["filterType"] == "LOT_SIZE":
-                    self._quantity_precision = len(str(float(f["stepSize"])).split(".")[-1].rstrip("0"))
-            
-            self._logger.info(
-                "Symbol info loaded - Price precision: %d, Quantity precision: %d",
-                self._price_precision, self._quantity_precision
-            )
-
-    def _round_price(self, price: float) -> float:
-        """Round price to meet exchange precision requirements."""
-        if self._price_precision is None:
-            return price  # Return as is if precision not yet known
-        return round(price, self._price_precision)
-
-    async def _place_grid_orders(self, symbol: str, mid_price: float) -> None:
-        """Place a new pair of grid orders around the mid price."""
-        async with self._order_lock:
-            # Cancel any existing orders first
-            remaining_orders = list(self._live.values())
-            for order in remaining_orders:
-                await self._cancel_order_safe(symbol, order.client_id)
-
-            # Place new buy order below mid price
-            buy_price = self._round_price(mid_price * (1 - self._grid_spacing_bps / 10000))
-            await self._place(symbol, "BUY", buy_price, self._grid_size)
-            
-            # Place new sell order above mid price
-            sell_price = self._round_price(mid_price * (1 + self._grid_spacing_bps / 10000))
-            await self._place(symbol, "SELL", sell_price, self._grid_size)
-            
-            self._logger.info(
-                "\n=== New Orders ===\n"
-                f"BUY  @ {buy_price:.2f}\n"
-                f"SELL @ {sell_price:.2f}\n"
-                f"(Mid: {mid_price:.2f})\n"
-                "================"
-            )
-
-    async def _reconcile(
-        self,
-        symbol: str,
-        bid_px: float,
-        bid_sz: float,
-        ask_px: float,
-        ask_sz: float,
-        ts: datetime,
-    ) -> None:
-        """Check if existing orders are too far from mid price and cancel them if needed."""
-        if not self._latest_ob:
-            return
-
-        mid_price = self._latest_ob.mid_price
-        
-        # Check if any existing orders are too far from mid price
-        orders_to_cancel = []
-        for order in self._live.values():
-            price_diff_bps = abs(order.price - mid_price) / mid_price * 10000
-            if price_diff_bps > self._grid_spacing_bps * 1.5:  # Add some buffer
-                orders_to_cancel.append(order)
-        
-        # Cancel orders that are too far from mid price
-        for order in orders_to_cancel:
-            await self._cancel_order_safe(symbol, order.client_id)
-
-    async def _update_balances_from_exchange(self, symbol: str) -> None:
-        """Fetch and update balances from the exchange."""
-        try:
-            account_info = await self._c.get_account_info()
-            base_currency = symbol[:-4]  # e.g., BTC from BTCUSDT
-            quote_currency = symbol[-4:]  # e.g., USDT from BTCUSDT
-            
-            base_balance = 0.0
-            quote_balance = 0.0
-            
-            for balance in account_info["balances"]:
-                if balance["asset"] == base_currency:
-                    base_balance = float(balance["free"])
-                elif balance["asset"] == quote_currency:
-                    quote_balance = float(balance["free"])
-            
-            self._inv.set_available_balance(base_balance, quote_balance)
-            self._logger.debug(
-                "Updated balances from exchange - Base: %.6f %s, Quote: %.2f %s",
-                base_balance, base_currency, quote_balance, quote_currency
-            )
-        except Exception as e:
-            self._logger.error("Failed to update balances from exchange: %s", e)
-            raise
-
-    async def _handle_fills(self, initial_order_event: asyncio.Event):
-        """Handle user events stream and process fills."""
-        self._logger.info("Starting user events stream handler")
-        
-        # Wait for signal to place initial orders
-        await initial_order_event.wait()
-        
-        # Place initial orders if we don't have any
-        if not self._live and self._latest_ob:
-            self._logger.info("Placing initial orders...")
-            await self._place_grid_orders(self._cfg["trading"]["symbol"].upper(), self._latest_ob.mid_price)
-        
-        async for evt in self._c.stream_user_events():
-            try:
-                # Debug log the raw event
-                self._logger.debug("Received user event: %s", evt)
-                
-                if evt.get("e") != "executionReport":
-                    continue
-                    
-                status = evt.get("X")
-                side = evt.get("S")
-                client_id = evt.get("c")
-                filled_qty = float(evt.get("l", 0))
-                filled_px = float(evt.get("L", 0))
-                symbol = evt.get("s")
-                order_type = evt.get("o")  # Order type
-                time_in_force = evt.get("f")  # Time in force
-                
-                self._logger.debug(
-                    "Processing execution report - Status: %s, Side: %s, Type: %s, TIF: %s, Qty: %.6f, Price: %.2f",
-                    status, side, order_type, time_in_force, filled_qty, filled_px
-                )
-
-                if status in {"FILLED", "PARTIALLY_FILLED"} and filled_qty > 0:
-                    self._logger.info(
-                        "\n=== Fill ===\n"
-                        f"{side} @ {filled_px:.2f}\n"
-                        "==========="
-                    )
-                    
-                    # Remove the filled order from live orders first
-                    self._live.pop(client_id, None)
-                    
-                    # Update balances from exchange
-                    await self._update_balances_from_exchange(symbol)
-                    
-                    # Record fill for statistics
-                    self._fills.append(Fill(
-                        side=side,
-                        price=filled_px,
-                        size=filled_qty,
-                        timestamp=datetime.utcnow()
-                    ))
-                    
-                    # Place new grid orders
-                    if self._latest_ob:
-                        await self._place_grid_orders(symbol, self._latest_ob.mid_price)
-                    
-                    # Report fill statistics
-                    self._report_fills()
-                    self._logger.debug("Fill report generated with %d fills", len(self._fills))
-
-                # Drop from live map if the order is closed
-                if status in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
-                    self._live.pop(client_id, None)
-                    
-            except Exception as e:
-                self._logger.error("Error processing user event: %s", e, exc_info=True)
-
-    async def _place(self, symbol: str, side: str, price: float, size: float):
-        """Place an order, ensuring it's on the correct side of the mid price."""
-        if self._latest_ob is None:
-            self._logger.warning("No orderbook data available, skipping order placement")
-            return
-            
-        mid_price = self._latest_ob.mid_price
-        
-        # Verify order is on correct side of mid price
-        if side == "BUY" and price >= mid_price:
-            self._logger.warning(
-                "Buy order price %.2f is above mid price %.2f, adjusting down",
-                price, mid_price
-            )
-            price = self._round_price(mid_price * (1 - self._grid_spacing_bps / 10000))
-        elif side == "SELL" and price <= mid_price:
-            self._logger.warning(
-                "Sell order price %.2f is below mid price %.2f, adjusting up",
-                price, mid_price
-            )
-            price = self._round_price(mid_price * (1 + self._grid_spacing_bps / 10000))
-            
-        client_id = f"volbot-{next(self._id_seq)}-{uuid.uuid4().hex[:8]}"
-        try:
-            # Log balances at DEBUG level
-            self._logger.debug(
-                "Current balances before placing %s order - Base: %.6f, Quote: %.2f",
-                side, self._inv.available_balances["base"], self._inv.available_balances["quote"]
-            )
-            
-            order: Order = await self._c.place_limit_order(symbol, side, price, size, client_id)
-            
-            # Verify the order was actually placed
-            exchange_order = await self._c.get_order_status(symbol, client_id)
-            if exchange_order is None:
-                raise RuntimeError(f"Order {client_id} not found on exchange after placement")
-                
-            self._live[client_id] = LiveOrder(
-                client_id=client_id,
-                side=side,
-                price=order.price,
-                size=order.size,
-            )
-            
-            # Log balances at DEBUG level
-            self._logger.debug(
-                "Balances after placing %s order - Base: %.6f, Quote: %.2f",
-                side, self._inv.available_balances["base"], self._inv.available_balances["quote"]
-            )
-            
-            self._logger.debug("%s @ %.2f", side, price)
-            
-        except Exception as exc:
-            self._logger.error("Failed to place order: %s", exc)
-            raise
-
-    async def _cancel_order_safe(self, symbol: str, client_id: str) -> bool:
-        """Safely cancel an order, checking if it exists first.
-        
-        Returns:
-            bool: True if the order was cancelled or didn't exist, False if there was an error
-        """
-        try:
-            # Check if order exists and is in a cancellable state
-            exchange_order = await self._c.get_order_status(symbol, client_id)
-            if exchange_order is None or exchange_order.status not in {"NEW", "PARTIALLY_FILLED"}:
-                self._live.pop(client_id, None)
-                return True
-                
-            # Order exists and is cancellable, try to cancel it
-            await self._c.cancel_order(symbol, client_id)
-            self._live.pop(client_id, None)
+    def _is_orderbook_stale(self) -> bool:
+        """Check if the current orderbook data is stale."""
+        if not self._last_ob_update:
             return True
-            
-        except Exception as e:
-            if "Unknown order" in str(e):
-                self._live.pop(client_id, None)
-                return True
-            self._logger.error("Error cancelling order %s: %s", client_id, e)
-            return False
+        return datetime.utcnow() - self._last_ob_update > self._ob_stale_threshold
