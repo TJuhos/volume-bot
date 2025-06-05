@@ -85,7 +85,6 @@ class OrderManager:
         # Latest orderbook state
         self._latest_ob: Optional[OrderBook] = None
         self._last_ob_update: Optional[datetime] = None
-        self._ob_stale_threshold = timedelta(seconds=5)  # Consider orderbook stale after 5 seconds
         
         # Exchange info
         self._symbol_info = None
@@ -165,7 +164,8 @@ class OrderManager:
             return
             
         # Safety check - if we have no orders and valid orderbook, place new orders
-        if not self._live and not self._is_orderbook_stale():
+        # But only if we're not in the middle of handling a fill
+        if not self._live and not self._order_lock.locked():
             self._logger.info("No live orders detected, placing new grid orders")
             await self._place_grid_orders(symbol, self._latest_ob.mid_price)
             return
@@ -226,8 +226,24 @@ class OrderManager:
         filled_px = float(evt.get("L", 0))
         symbol = evt.get("s")
         
+        # Log all execution reports for debugging
         self._logger.debug(
-            "Processing execution report for order %s:\n"
+            "Received execution report:\n"
+            f"  Client ID: {client_id}\n"
+            f"  Status: {status}\n"
+            f"  Side: {side}\n"
+            f"  Filled Qty: {filled_qty}\n"
+            f"  Fill Price: {filled_px}\n"
+            f"  Symbol: {symbol}"
+        )
+        
+        # Only process orders that we placed (they start with 'volbot-')
+        if not client_id or not client_id.startswith('volbot-'):
+            self._logger.debug("Skipping execution report for non-bot order: %s", client_id)
+            return
+            
+        self._logger.debug(
+            "Processing execution report for bot order %s:\n"
             f"  Status: {status}\n"
             f"  Side: {side}\n"
             f"  Filled Qty: {filled_qty}\n"
@@ -259,8 +275,20 @@ class OrderManager:
         opposite_side = "SELL" if side == "BUY" else "BUY"
         for order in list(self._live.values()):
             if order.side == opposite_side:
-                self._logger.info("Cancelling opposite side order after fill")
-                await self._cancel_order_safe(symbol, order.client_id)
+                # Check if the order still exists on the exchange before trying to cancel it
+                try:
+                    exchange_order = await self._c.get_order_status(symbol, order.client_id)
+                    if exchange_order and exchange_order.status in {"NEW", "PARTIALLY_FILLED"}:
+                        self._logger.info("Cancelling opposite side order after fill")
+                        await self._cancel_order_safe(symbol, order.client_id)
+                    else:
+                        self._logger.debug("Opposite side order %s no longer exists on exchange (status: %s)", 
+                                         order.client_id, exchange_order.status if exchange_order else "None")
+                        self._live.pop(order.client_id, None)
+                except Exception as e:
+                    self._logger.error("Error checking opposite order status: %s", e)
+                    # If we can't check the status, assume the order is gone
+                    self._live.pop(order.client_id, None)
         
         # Update balances from exchange
         await self._update_balances_from_exchange(symbol)
@@ -274,27 +302,11 @@ class OrderManager:
         ))
         
         # Always try to place new orders after a fill
-        if not self._is_orderbook_stale() and self._latest_ob:
+        if self._latest_ob:
             await self._place_grid_orders(symbol, self._latest_ob.mid_price)
-        else:
-            self._logger.warning(
-                "Orderbook is stale after fill (last update: %s), waiting for fresh data before placing new orders",
-                self._last_ob_update
-            )
-            # Start a task to wait for fresh data and place orders
-            asyncio.create_task(self._wait_and_place_orders(symbol))
         
         # Report fill statistics
         self._report_fills()
-
-    async def _wait_and_place_orders(self, symbol: str) -> None:
-        """Wait for fresh orderbook data and place new orders."""
-        while self._is_orderbook_stale():
-            await asyncio.sleep(0.1)  # Wait for 100ms before checking again
-            
-        if self._latest_ob:
-            self._logger.info("Orderbook is fresh again, placing new orders")
-            await self._place_grid_orders(symbol, self._latest_ob.mid_price)
 
     async def _check_order_drift(self, symbol: str, bid_px: float, bid_sz: float, ask_px: float, ask_sz: float, ts: datetime) -> None:
         """Check if orders have drifted too far from mid price and cancel if needed."""
@@ -339,7 +351,7 @@ class OrderManager:
             await self._cancel_order_safe(symbol, order.client_id)
             
         # If we cancelled any orders, place new ones if we have fresh data
-        if orders_to_cancel and not self._is_orderbook_stale() and self._latest_ob:
+        if orders_to_cancel and self._latest_ob:
             self._logger.info("Placing new orders after drift cancellation")
             await self._place_grid_orders(symbol, self._latest_ob.mid_price)
 
@@ -363,11 +375,35 @@ class OrderManager:
             sell_price = self._round_price(current_mid * (1 + self._grid_spacing_bps / 10000))
             
             try:
+                # Place both orders in sequence
+                buy_order = None
+                sell_order = None
+                
                 # Place buy order
-                await self._place(symbol, "BUY", buy_price, self._grid_size)
+                try:
+                    buy_order = await self._place(symbol, "BUY", buy_price, self._grid_size)
+                    if not buy_order:
+                        self._logger.error("Failed to place buy order - no order returned")
+                        return
+                except Exception as e:
+                    self._logger.error("Failed to place buy order: %s", e)
+                    return
                 
                 # Place sell order
-                await self._place(symbol, "SELL", sell_price, self._grid_size)
+                try:
+                    sell_order = await self._place(symbol, "SELL", sell_price, self._grid_size)
+                    if not sell_order:
+                        self._logger.error("Failed to place sell order - no order returned")
+                        # Cancel the buy order if sell order failed
+                        if buy_order:
+                            await self._cancel_order_safe(symbol, buy_order.client_id)
+                        return
+                except Exception as e:
+                    self._logger.error("Failed to place sell order: %s", e)
+                    # Cancel the buy order if sell order failed
+                    if buy_order:
+                        await self._cancel_order_safe(symbol, buy_order.client_id)
+                    return
                 
                 # If we get here, both orders were placed successfully
                 self._logger.info(
@@ -389,42 +425,10 @@ class OrderManager:
                 if self._latest_ob and self._latest_ob.best_bid and self._latest_ob.best_ask:
                     await self._place_grid_orders(symbol, self._latest_ob.mid_price)
 
-    async def _cancel_order_safe(self, symbol: str, client_id: str) -> bool:
-        """Safely cancel an order, checking if it exists first."""
-        try:
-            # Check if order exists and is in a cancellable state
-            exchange_order = await self._c.get_order_status(symbol, client_id)
-            if exchange_order is None:
-                self._logger.debug("Order %s not found on exchange, removing from local tracking", client_id)
-                self._live.pop(client_id, None)
-                return True
-                
-            if exchange_order.status not in {"NEW", "PARTIALLY_FILLED"}:
-                self._logger.debug("Order %s is in non-cancellable state %s, removing from local tracking", 
-                                 client_id, exchange_order.status)
-                self._live.pop(client_id, None)
-                return True
-                
-            # Order exists and is cancellable, try to cancel it
-            await self._c.cancel_order(symbol, client_id)
-            self._live.pop(client_id, None)
-            return True
-            
-        except Exception as e:
-            if "Unknown order" in str(e):
-                self._logger.debug("Order %s not found on exchange (Unknown order), removing from local tracking", client_id)
-                self._live.pop(client_id, None)
-                return True
-            self._logger.error("Error cancelling order %s: %s", client_id, e)
-            return False
-
     async def _place(self, symbol: str, side: str, price: float, size: float):
         """Place an order, ensuring it's on the correct side of the mid price."""
-        if self._latest_ob is None or self._is_orderbook_stale():
-            self._logger.warning(
-                "No valid orderbook data available (last update: %s), skipping order placement",
-                self._last_ob_update
-            )
+        if self._latest_ob is None:
+            self._logger.warning("No orderbook data available, skipping order placement")
             return
             
         mid_price = self._latest_ob.mid_price
@@ -446,22 +450,18 @@ class OrderManager:
         client_id = f"volbot-{next(self._id_seq)}-{uuid.uuid4().hex[:8]}"
         try:
             self._logger.debug("Placing %s order %s @ %.2f", side, client_id, price)
-            order: Order = await self._c.place_limit_order(symbol, side, price, size, client_id)
+            await self._c.place_limit_order(symbol, side, price, size, client_id)
             
-            # Verify the order was actually placed
-            exchange_order = await self._c.get_order_status(symbol, client_id)
-            if exchange_order is None:
-                self._logger.error("Order %s not found on exchange after placement", client_id)
-                raise RuntimeError(f"Order {client_id} not found on exchange after placement")
-                
+            # Create LiveOrder with our known values
             self._live[client_id] = LiveOrder(
                 client_id=client_id,
                 side=side,
-                price=order.price,
-                size=order.size,
+                price=price,
+                size=size,
             )
             
             self._logger.info("Successfully placed %s order %s @ %.2f", side, client_id, price)
+            return self._live[client_id]
             
         except Exception as exc:
             self._logger.error("Failed to place order: %s", exc)
@@ -688,8 +688,31 @@ class OrderManager:
         
         self._last_fill_report = now
 
-    def _is_orderbook_stale(self) -> bool:
-        """Check if the current orderbook data is stale."""
-        if not self._last_ob_update:
+    async def _cancel_order_safe(self, symbol: str, client_id: str) -> bool:
+        """Safely cancel an order, checking if it exists first."""
+        try:
+            # Check if order exists and is in a cancellable state
+            exchange_order = await self._c.get_order_status(symbol, client_id)
+            if exchange_order is None:
+                self._logger.debug("Order %s not found on exchange, removing from local tracking", client_id)
+                self._live.pop(client_id, None)
+                return True
+                
+            if exchange_order.status not in {"NEW", "PARTIALLY_FILLED"}:
+                self._logger.debug("Order %s is in non-cancellable state %s, removing from local tracking", 
+                                 client_id, exchange_order.status)
+                self._live.pop(client_id, None)
+                return True
+                
+            # Order exists and is cancellable, try to cancel it
+            await self._c.cancel_order(symbol, client_id)
+            self._live.pop(client_id, None)
             return True
-        return datetime.utcnow() - self._last_ob_update > self._ob_stale_threshold
+            
+        except Exception as e:
+            if "Unknown order" in str(e):
+                self._logger.debug("Order %s not found on exchange (Unknown order), removing from local tracking", client_id)
+                self._live.pop(client_id, None)
+                return True
+            self._logger.error("Error cancelling order %s: %s", client_id, e)
+            return False
