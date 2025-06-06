@@ -40,6 +40,8 @@ def setup_logger(level: str = "INFO", path: str | None = None) -> logging.Logger
     return root
 
 
-def get_child_logger(parent: logging.Logger, name: str) -> logging.Logger:
+def get_child_logger(parent: logging.Logger | None, name: str) -> logging.Logger:
     """Return a namespaced child logger under *parent*."""
+    if parent is None:
+        parent = logging.getLogger("volbot")
     return parent.getChild(name)

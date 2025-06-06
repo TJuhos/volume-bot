@@ -13,6 +13,7 @@ from bot.connectors.base import BaseConnector, Order
 from bot.data import CombinedStream, OrderBook
 from bot.strategy.inventory import InventoryManager
 from bot.strategy.market_maker import MarketMakerConfig, MarketMakerStrategy
+from bot.strategy.pnl_tracker import PnLTracker
 from bot.utils.logger import get_child_logger
 
 
@@ -31,18 +32,7 @@ class Fill:
     price: float
     size: float
     timestamp: datetime
-    pnl: float = 0.0  # PnL for this fill if it's part of a round trip
-
-
-@dataclass
-class PnLStats:
-    initial_account_value: float
-    initial_base_balance: float
-    initial_quote_balance: float
-    initial_base_price: float
-    current_account_value: float = 0.0
-    grid_pnl: float = 0.0  # PnL from grid trading only
-    last_update: datetime = field(default_factory=datetime.utcnow)
+    fee: float = 0.0
 
 
 class OrderManager:
@@ -92,7 +82,7 @@ class OrderManager:
         self._quantity_precision = None
         
         # PnL tracking
-        self._pnl_stats: Optional[PnLStats] = None
+        self._pnl_tracker: Optional[PnLTracker] = None
 
     async def run(self) -> None:
         """Main entry point for the order manager."""
@@ -158,6 +148,21 @@ class OrderManager:
         self._latest_ob = OrderBook(ob_snapshot)
         self._last_ob_update = ob_snapshot.timestamp
         
+        # Initialize PnL tracker if we have valid orderbook and it's not initialized yet
+        if self._pnl_tracker is None and self._latest_ob.best_bid and self._latest_ob.best_ask:
+            base_balance = self._inv.available_balances["base"]
+            quote_balance = self._inv.available_balances["quote"]
+            self._pnl_tracker = PnLTracker(
+                initial_mid_price=self._latest_ob.mid_price,
+                initial_base_balance=base_balance,
+                initial_quote_balance=quote_balance
+            )
+            self._logger.info("PnL tracker initialized with mid price: %.2f", self._latest_ob.mid_price)
+        
+        # Update PnL tracker with new mid price
+        if self._pnl_tracker and self._latest_ob.best_bid and self._latest_ob.best_ask:
+            self._pnl_tracker.update_mid_price(self._latest_ob.mid_price)
+        
         # Skip if we don't have a valid orderbook yet
         if not self._latest_ob.best_bid or not self._latest_ob.best_ask:
             self._logger.debug("Waiting for valid orderbook...")
@@ -194,28 +199,44 @@ class OrderManager:
                 self._latest_ob.mid_price
             )
         
-        async for evt in self._c.stream_user_events():
+        while True:  # Keep trying to reconnect if stream ends
             try:
-                self._logger.debug("Received user event: %s", evt)
-                if evt.get("e") != "executionReport":
-                    continue
+                async for evt in self._c.stream_user_events():
+                    try:
+                        self._logger.debug("Received user event: %s", evt)
+                        if evt.get("e") != "executionReport":
+                            continue
+                        
+                        # Log the full execution report
+                        self._logger.debug(
+                            "Processing execution report:\n"
+                            f"  Order ID: {evt.get('c')}\n"
+                            f"  Status: {evt.get('X')}\n"
+                            f"  Side: {evt.get('S')}\n"
+                            f"  Price: {evt.get('p')}\n"
+                            f"  Quantity: {evt.get('q')}\n"
+                            f"  Filled: {evt.get('l')}\n"
+                            f"  Fill Price: {evt.get('L')}\n"
+                            f"  Fee: {evt.get('n', 0)} {evt.get('N', '')}\n"
+                            f"  Symbol: {evt.get('s')}"
+                        )
+                        
+                        await self._process_execution_report(evt)
+                    except Exception as e:
+                        self._logger.error("Error processing user event: %s", e, exc_info=True)
+                        continue  # Continue processing other events even if one fails
                 
-                # Log the full execution report
-                self._logger.debug(
-                    "Processing execution report:\n"
-                    f"  Order ID: {evt.get('c')}\n"
-                    f"  Status: {evt.get('X')}\n"
-                    f"  Side: {evt.get('S')}\n"
-                    f"  Price: {evt.get('p')}\n"
-                    f"  Quantity: {evt.get('q')}\n"
-                    f"  Filled: {evt.get('l')}\n"
-                    f"  Fill Price: {evt.get('L')}\n"
-                    f"  Symbol: {evt.get('s')}"
-                )
+                # If we get here, the stream ended normally
+                self._logger.warning("User events stream ended, attempting to reconnect...")
+                await asyncio.sleep(1)  # Wait a bit before reconnecting
                 
-                await self._process_execution_report(evt)
+            except asyncio.CancelledError:
+                self._logger.info("User events handler cancelled")
+                raise
             except Exception as e:
-                self._logger.error("Error processing user event: %s", e, exc_info=True)
+                self._logger.error("Error in user events stream: %s", e, exc_info=True)
+                await asyncio.sleep(1)  # Wait a bit before retrying
+                continue  # Try to reconnect
 
     async def _process_execution_report(self, evt: dict) -> None:
         """Process an execution report event."""
@@ -224,6 +245,8 @@ class OrderManager:
         client_id = evt.get("c")
         filled_qty = float(evt.get("l", 0))
         filled_px = float(evt.get("L", 0))
+        fee = float(evt.get("n", 0))  # Get fee amount
+        fee_asset = evt.get("N", "")  # Get fee asset
         symbol = evt.get("s")
         
         # Log all execution reports for debugging
@@ -234,6 +257,7 @@ class OrderManager:
             f"  Side: {side}\n"
             f"  Filled Qty: {filled_qty}\n"
             f"  Fill Price: {filled_px}\n"
+            f"  Fee: {fee} {fee_asset}\n"
             f"  Symbol: {symbol}"
         )
         
@@ -248,120 +272,111 @@ class OrderManager:
             f"  Side: {side}\n"
             f"  Filled Qty: {filled_qty}\n"
             f"  Fill Price: {filled_px}\n"
+            f"  Fee: {fee} {fee_asset}\n"
             f"  Symbol: {symbol}",
             client_id
         )
         
         if status in {"FILLED", "PARTIALLY_FILLED"} and filled_qty > 0:
-            await self._handle_fill(symbol, side, client_id, filled_qty, filled_px)
+            await self._handle_fill(symbol, client_id, side, filled_px, filled_qty, fee)
         
         # Drop from live map if the order is closed
         if status in {"FILLED", "CANCELED", "EXPIRED", "REJECTED"}:
             self._logger.info("Removing order %s from live orders (status: %s)", client_id, status)
             self._live.pop(client_id, None)
 
-    async def _handle_fill(self, symbol: str, side: str, client_id: str, filled_qty: float, filled_px: float) -> None:
-        """Handle a fill event."""
+    async def _handle_fill(self, symbol: str, client_id: str, side: str, price: float, size: float, fee: float = 0.0) -> None:
+        """Handle a fill event by updating the PnL tracker and placing new orders."""
         self._logger.info(
-            "\n=== Fill ===\n"
-            f"{side} @ {filled_px:.2f}\n"
-            "==========="
+            "Fill: %s %.6f @ %.2f (fee: %.6f)",
+            side, size, price, fee
         )
+        
+        # Update PnL tracker
+        if self._pnl_tracker:
+            try:
+                # Log the order info before processing
+                if client_id in self._pnl_tracker._orders:
+                    order_info = self._pnl_tracker._orders[client_id]
+                    self._logger.debug(
+                        "Processing fill PnL:\n"
+                        f"  Order side: {order_info.side}\n"
+                        f"  Order size: {order_info.size}\n"
+                        f"  Order mid price: {order_info.mid_price:.2f}\n"
+                        f"  Fill price: {price:.2f}\n"
+                        f"  Fill size: {size:.6f}\n"
+                        f"  Fee: {fee:.6f}\n"
+                        f"  Current grid PnL: {self._pnl_tracker.grid_pnl:.2f}"
+                    )
+                self._pnl_tracker.process_fill(client_id, price, fee)
+                self._logger.info(
+                    "Updated grid PnL: %.2f USD (%.2f%%)",
+                    self._pnl_tracker.grid_pnl,
+                    self._pnl_tracker.grid_return_pct
+                )
+            except ValueError as e:
+                self._logger.error("Error processing fill PnL: %s", e)
+        
+        # Record the fill
+        self._fills.append(Fill(
+            timestamp=datetime.now(),
+            side=side,
+            price=price,
+            size=size,
+            fee=fee
+        ))
         
         # Remove the filled order from live orders
         self._live.pop(client_id, None)
         
-        # Cancel the opposite side order if it exists
-        opposite_side = "SELL" if side == "BUY" else "BUY"
-        for order in list(self._live.values()):
-            if order.side == opposite_side:
-                # Check if the order still exists on the exchange before trying to cancel it
-                try:
-                    exchange_order = await self._c.get_order_status(symbol, order.client_id)
-                    if exchange_order and exchange_order.status in {"NEW", "PARTIALLY_FILLED"}:
-                        self._logger.info("Cancelling opposite side order after fill")
-                        await self._cancel_order_safe(symbol, order.client_id)
-                    else:
-                        self._logger.debug("Opposite side order %s no longer exists on exchange (status: %s)", 
-                                         order.client_id, exchange_order.status if exchange_order else "None")
-                        self._live.pop(order.client_id, None)
-                except Exception as e:
-                    self._logger.error("Error checking opposite order status: %s", e)
-                    # If we can't check the status, assume the order is gone
-                    self._live.pop(order.client_id, None)
-        
-        # Update balances from exchange
-        await self._update_balances_from_exchange(symbol)
-        
-        # Record fill for statistics
-        self._fills.append(Fill(
-            side=side,
-            price=filled_px,
-            size=filled_qty,
-            timestamp=datetime.utcnow()
-        ))
-        
-        # Always try to place new orders after a fill
-        if self._latest_ob:
+        # Immediately refresh the entire grid
+        if self._latest_ob and self._latest_ob.best_bid and self._latest_ob.best_ask:
+            self._logger.info("Refreshing grid after fill")
             await self._place_grid_orders(symbol, self._latest_ob.mid_price)
-        
-        # Report fill statistics
-        self._report_fills()
 
     async def _check_order_drift(self, symbol: str, bid_px: float, bid_sz: float, ask_px: float, ask_sz: float, ts: datetime) -> None:
-        """Check if orders have drifted too far from mid price and cancel if needed."""
+        """Check if orders still exist on the exchange and remove any that don't."""
         if not self._latest_ob:
             return
 
-        mid_price = self._latest_ob.mid_price
-        
-        # Check if any existing orders are too far from mid price
-        orders_to_cancel = []
         for order in list(self._live.values()):  # Create a copy to avoid modification during iteration
             try:
                 # Verify order still exists on exchange
                 exchange_order = await self._c.get_order_status(symbol, order.client_id)
                 if exchange_order is None:
-                    self._logger.debug("Order %s not found on exchange during drift check, removing from local tracking", 
+                    self._logger.debug("Order %s not found on exchange, removing from local tracking", 
                                      order.client_id)
                     self._live.pop(order.client_id, None)
-                    continue
-                    
-                price_diff_bps = abs(order.price - mid_price) / mid_price * 10000
-                drift_threshold = self._grid_spacing_bps * 2.0  # Allow orders to drift up to 2x the grid spacing
-                self._logger.debug(
-                    "Checking order drift for %s order @ %.2f:\n"
-                    f"  Mid price: {mid_price:.2f}\n"
-                    f"  Price diff: {price_diff_bps:.1f} bps\n"
-                    f"  Threshold: {drift_threshold:.1f} bps",
-                    order.side, order.price
-                )
-                if price_diff_bps > drift_threshold:
-                    self._logger.info(
-                        "Order %s @ %.2f drifted too far from mid price %.2f (%.1f bps > %.1f bps threshold)",
-                        order.side, order.price, mid_price, price_diff_bps, drift_threshold
-                    )
-                    orders_to_cancel.append(order)
             except Exception as e:
                 self._logger.error("Error checking order %s status: %s", order.client_id, e)
                 continue
-        
-        # Cancel orders that are too far from mid price
-        for order in orders_to_cancel:
-            await self._cancel_order_safe(symbol, order.client_id)
-            
-        # If we cancelled any orders, place new ones if we have fresh data
-        if orders_to_cancel and self._latest_ob:
-            self._logger.info("Placing new orders after drift cancellation")
-            await self._place_grid_orders(symbol, self._latest_ob.mid_price)
 
     async def _place_grid_orders(self, symbol: str, mid_price: float) -> None:
-        """Place a new pair of grid orders around the mid price."""
+        """Place 5 grid orders on each side of the mid price, all spaced 1 bps apart."""
         async with self._order_lock:
             # Cancel any existing orders first
             remaining_orders = list(self._live.values())
-            for order in remaining_orders:
-                await self._cancel_order_safe(symbol, order.client_id)
+            
+            # Check which orders still exist and need to be cancelled
+            async def check_and_cancel_order(order):
+                try:
+                    exchange_order = await self._c.get_order_status(symbol, order.client_id)
+                    if exchange_order and exchange_order.status in {"NEW", "PARTIALLY_FILLED"}:
+                        return order
+                    else:
+                        self._live.pop(order.client_id, None)
+                        return None
+                except Exception as e:
+                    self._logger.error("Error checking order status: %s", e)
+                    return None
+
+            # Check all orders in parallel
+            orders_to_cancel = await asyncio.gather(*[check_and_cancel_order(order) for order in remaining_orders])
+            orders_to_cancel = [o for o in orders_to_cancel if o is not None]
+
+            # Cancel all existing orders in parallel
+            if orders_to_cancel:
+                await asyncio.gather(*[self._cancel_order_safe(symbol, order.client_id) for order in orders_to_cancel])
 
             # Get current mid price from orderbook
             if not self._latest_ob or not self._latest_ob.best_bid or not self._latest_ob.best_ask:
@@ -370,60 +385,109 @@ class OrderManager:
 
             current_mid = self._latest_ob.mid_price
             
-            # Calculate both prices upfront
-            buy_price = self._round_price(current_mid * (1 - self._grid_spacing_bps / 10000))
-            sell_price = self._round_price(current_mid * (1 + self._grid_spacing_bps / 10000))
+            # Define grid levels (in basis points from mid)
+            grid_levels = list(range(1, 3))  # 1 to 2 bps
             
             try:
-                # Place both orders in sequence
-                buy_order = None
-                sell_order = None
+                # Prepare all order parameters
+                buy_orders = []
+                sell_orders = []
                 
-                # Place buy order
-                try:
-                    buy_order = await self._place(symbol, "BUY", buy_price, self._grid_size)
-                    if not buy_order:
-                        self._logger.error("Failed to place buy order - no order returned")
-                        return
-                except Exception as e:
-                    self._logger.error("Failed to place buy order: %s", e)
-                    return
+                for level in grid_levels:
+                    # Buy orders
+                    buy_price = self._round_price(current_mid * (1 - level / 10000))
+                    buy_size = self._round_quantity(self._grid_size)
+                    buy_orders.append((buy_price, buy_size))
+                    
+                    # Sell orders
+                    sell_price = self._round_price(current_mid * (1 + level / 10000))
+                    sell_size = self._round_quantity(self._grid_size)
+                    sell_orders.append((sell_price, sell_size))
+                    
+                    # Log expected grid spacing
+                    self._logger.debug(
+                        f"Grid Level {level} bps:\n"
+                        f"  Buy: {buy_price:.2f} (mid - {level} bps)\n"
+                        f"  Sell: {sell_price:.2f} (mid + {level} bps)\n"
+                        f"  Expected spread: {current_mid * (2 * level / 10000):.2f}\n"
+                        f"  Actual spread: {(sell_price - buy_price):.2f}"
+                    )
+
+                # Place all buy orders in parallel
+                async def place_buy_order(price, size):
+                    try:
+                        order = await self._place(symbol, "BUY", price, size)
+                        if order and self._pnl_tracker:
+                            self._pnl_tracker.register_order(order.client_id, "BUY", size)
+                            self._logger.debug(
+                                f"Placed BUY order:\n"
+                                f"  Price: {price:.2f}\n"
+                                f"  Size: {size:.6f}\n"
+                                f"  Order ID: {order.client_id}"
+                            )
+                        return order
+                    except Exception as e:
+                        self._logger.error("Failed to place buy order at %.2f: %s", price, e)
+                        return None
+
+                # Place all sell orders in parallel
+                async def place_sell_order(price, size):
+                    try:
+                        order = await self._place(symbol, "SELL", price, size)
+                        if order and self._pnl_tracker:
+                            self._pnl_tracker.register_order(order.client_id, "SELL", size)
+                            self._logger.debug(
+                                f"Placed SELL order:\n"
+                                f"  Price: {price:.2f}\n"
+                                f"  Size: {size:.6f}\n"
+                                f"  Order ID: {order.client_id}"
+                            )
+                        return order
+                    except Exception as e:
+                        self._logger.error("Failed to place sell order at %.2f: %s", price, e)
+                        return None
+
+                # Place all orders in parallel
+                buy_results = await asyncio.gather(*[place_buy_order(price, size) for price, size in buy_orders])
+                sell_results = await asyncio.gather(*[place_sell_order(price, size) for price, size in sell_orders])
                 
-                # Place sell order
-                try:
-                    sell_order = await self._place(symbol, "SELL", sell_price, self._grid_size)
-                    if not sell_order:
-                        self._logger.error("Failed to place sell order - no order returned")
-                        # Cancel the buy order if sell order failed
-                        if buy_order:
-                            await self._cancel_order_safe(symbol, buy_order.client_id)
-                        return
-                except Exception as e:
-                    self._logger.error("Failed to place sell order: %s", e)
-                    # Cancel the buy order if sell order failed
-                    if buy_order:
-                        await self._cancel_order_safe(symbol, buy_order.client_id)
-                    return
-                
-                # If we get here, both orders were placed successfully
+                # Log placed orders
                 self._logger.info(
-                    "\n=== New Orders ===\n"
-                    f"BUY  @ {buy_price:.2f}\n"
-                    f"SELL @ {sell_price:.2f}\n"
-                    f"(Mid: {current_mid:.2f})\n"
-                    "================"
+                    "\n=== New Grid Orders ===\n"
+                    f"Mid Price: {current_mid:.2f}\n"
+                    "Buy Orders:\n" +
+                    "\n".join(f"  {level} bps: {size:.6f} @ {price:.2f}" 
+                             for (price, size), level in zip(buy_orders, grid_levels)) +
+                    "\nSell Orders:\n" +
+                    "\n".join(f"  {level} bps: {size:.6f} @ {price:.2f}"
+                             for (price, size), level in zip(sell_orders, grid_levels)) +
+                    "\n====================="
                 )
                 
             except Exception as e:
-                self._logger.error("Failed to place orders: %s", e)
+                self._logger.error("Failed to place grid orders: %s", e)
                 # Cancel any orders that might have been placed
                 for order in list(self._live.values()):
-                    await self._cancel_order_safe(symbol, order.client_id)
+                    try:
+                        exchange_order = await self._c.get_order_status(symbol, order.client_id)
+                        if exchange_order and exchange_order.status in {"NEW", "PARTIALLY_FILLED"}:
+                            await self._cancel_order_safe(symbol, order.client_id)
+                        else:
+                            self._live.pop(order.client_id, None)
+                    except Exception as cancel_error:
+                        self._logger.error("Error cancelling order after grid placement failure: %s", cancel_error)
+                        continue
                 
                 # Retry once after a short delay
                 await asyncio.sleep(0.5)
                 if self._latest_ob and self._latest_ob.best_bid and self._latest_ob.best_ask:
                     await self._place_grid_orders(symbol, self._latest_ob.mid_price)
+
+    def _round_quantity(self, quantity: float) -> float:
+        """Round quantity to meet exchange precision requirements."""
+        if self._quantity_precision is None:
+            return quantity
+        return round(quantity, self._quantity_precision)
 
     async def _place(self, symbol: str, side: str, price: float, size: float):
         """Place an order, ensuring it's on the correct side of the mid price."""
@@ -460,7 +524,7 @@ class OrderManager:
                 size=size,
             )
             
-            self._logger.info("Successfully placed %s order %s @ %.2f", side, client_id, price)
+            self._logger.debug("Successfully placed %s order %s @ %.2f", side, client_id, price)
             return self._live[client_id]
             
         except Exception as exc:
@@ -502,6 +566,18 @@ class OrderManager:
                     quote_balance = float(balance["free"])
             
             self._inv.set_available_balance(base_balance, quote_balance)
+            
+            # Initialize PnL tracker with initial balances and price
+            if self._latest_ob and self._latest_ob.best_bid and self._latest_ob.best_ask:
+                self._pnl_tracker = PnLTracker(
+                    initial_mid_price=self._latest_ob.mid_price,
+                    initial_base_balance=base_balance,
+                    initial_quote_balance=quote_balance
+                )
+                self._logger.info("PnL tracker initialized with mid price: %.2f", self._latest_ob.mid_price)
+            else:
+                self._logger.warning("Cannot initialize PnL tracker - waiting for valid orderbook")
+            
             self._logger.info(
                 "Initial balances loaded - Base: %.6f %s, Quote: %.2f %s",
                 base_balance, base_currency, quote_balance, quote_currency
@@ -558,49 +634,30 @@ class OrderManager:
             raise
 
     async def _report_status(self, symbol: str, ob: OrderBook) -> None:
-        """Report current position, orders, and market state."""
-        # Get current position
-        position = self._inv.position
-        position_value = position * ob.mid_price
+        """Report current status including PnL metrics."""
+        # Get current account value
         account_value = self._inv.get_account_value(ob.mid_price)
         
-        # Format live orders
+        # Get live orders info
         live_orders = []
-        # Create a copy of live orders to iterate over
-        orders_to_check = list(self._live.values())
-        self._logger.debug("Checking status of %d live orders", len(orders_to_check))
-        for order in orders_to_check:
-            try:
-                exchange_order = await self._c.get_order_status(symbol, order.client_id)
-                if exchange_order is None:
-                    self._logger.warning("Order %s not found on exchange, removing from live orders", order.client_id)
-                    self._live.pop(order.client_id, None)
-                    continue
-                    
-                age = (datetime.utcnow() - order.birth).total_seconds()
-                live_orders.append(
-                    f"{order.side} @ {order.price:.2f} ({age:.1f}s)"
-                )
-            except Exception as e:
-                self._logger.error("Error getting order status for %s: %s", order.client_id, e)
-                live_orders.append(
-                    f"{order.side} @ {order.price:.2f} (ERROR)"
-                )
+        for order in self._live.values():
+            live_orders.append(f"{order.side} {order.size} @ {order.price}")
         
-        # Calculate PnL metrics if available
+        # Sort orders by price in descending order (like an orderbook)
+        live_orders.sort(key=lambda x: float(x.split('@')[1]), reverse=True)
+        
+        # Get PnL info if available
         pnl_info = ""
-        if self._pnl_stats:
-            total_return = (account_value - self._pnl_stats.initial_account_value) / self._pnl_stats.initial_account_value * 100
-            grid_return = self._pnl_stats.grid_pnl / self._pnl_stats.initial_account_value * 100
-            price_return = ((ob.mid_price - self._pnl_stats.initial_base_price) / self._pnl_stats.initial_base_price) * 100
-            
+        if self._pnl_tracker is not None:
             pnl_info = (
                 f"\nPnL Metrics:\n"
-                f"  Grid Strategy PnL: {self._pnl_stats.grid_pnl:.2f} USD ({grid_return:.2f}%)\n"
-                f"  Total Return: {total_return:.2f}%\n"
-                f"  Base Asset Return: {price_return:.2f}%"
+                f"  Grid Trading PnL: {self._pnl_tracker.grid_pnl:.2f} USD ({self._pnl_tracker.grid_return_pct:.2f}%)\n"
+                f"  Total PnL: {self._pnl_tracker.total_pnl:.2f} USD ({self._pnl_tracker.realized_return_pct:.2f}%)\n"
+                f"  Exposure PnL: {self._pnl_tracker.expo_pnl:.2f} USD ({self._pnl_tracker.exposure_return_pct:.2f}%)"
             )
-            
+        else:
+            pnl_info = "\nPnL Metrics: Not yet initialized (waiting for valid orderbook)"
+        
         # Log status
         self._logger.info(
             "\n=== Status Report ===\n"
@@ -616,7 +673,7 @@ class OrderManager:
         )
 
     def _report_fills(self) -> None:
-        """Report fill statistics and round trips."""
+        """Report fill statistics."""
         if not self._fills:
             return
             
@@ -629,62 +686,26 @@ class OrderManager:
         buy_fills = [f for f in self._fills if f.side == "BUY"]
         sell_fills = [f for f in self._fills if f.side == "SELL"]
         
-        # Calculate round trips
-        round_trips: List[Tuple[Fill, Fill]] = []
-        remaining_buys = buy_fills.copy()
-        remaining_sells = sell_fills.copy()
-        
-        # Match buys with sells to form round trips
-        for buy in buy_fills:
-            for sell in remaining_sells:
-                if sell.timestamp > buy.timestamp:
-                    pnl = (sell.price - buy.price) * buy.size
-                    buy.pnl = pnl
-                    sell.pnl = pnl
-                    round_trips.append((buy, sell))
-                    remaining_sells.remove(sell)
-                    break
-        
-        # Calculate PnL
-        total_pnl = sum(trip[0].pnl for trip in round_trips)
-        
-        # Update PnL stats if we have them
-        if self._pnl_stats and self._latest_ob:
-            self._pnl_stats.grid_pnl = total_pnl
-            self._pnl_stats.current_account_value = self._inv.get_account_value(self._latest_ob.mid_price)
-            self._pnl_stats.last_update = now
-            
-            # Calculate total return and grid strategy return
-            total_return = (self._pnl_stats.current_account_value - self._pnl_stats.initial_account_value) / self._pnl_stats.initial_account_value * 100
-            grid_return = self._pnl_stats.grid_pnl / self._pnl_stats.initial_account_value * 100
-            price_return = ((self._latest_ob.mid_price - self._pnl_stats.initial_base_price) / self._pnl_stats.initial_base_price) * 100
-            
-            # Log fill report with both PnL metrics
-            self._logger.debug(
-                "\n=== Fill Report ===\n"
-                f"Total Fills: {total_fills}\n"
-                f"Buy Fills: {len(buy_fills)}\n"
-                f"Sell Fills: {len(sell_fills)}\n"
-                f"Round Trips: {len(round_trips)}\n"
-                f"Grid Strategy PnL: {total_pnl:.2f} USD\n"
-                f"Grid Strategy Return: {grid_return:.2f}%\n"
-                f"Total Account Value: {self._pnl_stats.current_account_value:.2f} USD\n"
-                f"Total Return: {total_return:.2f}%\n"
-                f"Base Asset Return: {price_return:.2f}%\n"
-                "==================="
+        # Get PnL info if available
+        pnl_info = ""
+        if self._pnl_tracker is not None:
+            pnl_info = (
+                f"Grid Trading PnL: {self._pnl_tracker.grid_pnl:.2f} USD ({self._pnl_tracker.grid_return_pct:.2f}%)\n"
+                f"Total PnL: {self._pnl_tracker.total_pnl:.2f} USD ({self._pnl_tracker.realized_return_pct:.2f}%)\n"
+                f"Exposure PnL: {self._pnl_tracker.expo_pnl:.2f} USD ({self._pnl_tracker.exposure_return_pct:.2f}%)"
             )
         else:
-            # Log basic fill report if PnL stats not available
-            self._logger.debug(
-                "\n=== Fill Report ===\n"
-                f"Total Fills: {total_fills}\n"
-                f"Buy Fills: {len(buy_fills)}\n"
-                f"Sell Fills: {len(sell_fills)}\n"
-                f"Round Trips: {len(round_trips)}\n"
-                f"Total PnL: {total_pnl:.2f} USD\n"
-                f"Average PnL per Round Trip: {total_pnl/len(round_trips) if round_trips else 0:.2f} USD\n"
-                "==================="
-            )
+            pnl_info = "PnL Metrics: Not yet initialized (waiting for valid orderbook)"
+        
+        # Log fill report
+        self._logger.info(
+            "\n=== Fill Report ===\n"
+            f"Total Fills: {total_fills}\n"
+            f"Buy Fills: {len(buy_fills)}\n"
+            f"Sell Fills: {len(sell_fills)}\n"
+            f"{pnl_info}\n"
+            "==================="
+        )
         
         self._last_fill_report = now
 
