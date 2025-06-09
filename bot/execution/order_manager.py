@@ -15,6 +15,7 @@ from bot.strategy.inventory import InventoryManager
 from bot.strategy.market_maker import MarketMakerConfig, MarketMakerStrategy
 from bot.strategy.pnl_tracker import PnLTracker
 from bot.utils.logger import get_child_logger
+from bot.execution.websocket_server import WebSocketServer
 
 
 @dataclass
@@ -42,6 +43,9 @@ class OrderManager:
         self._c = connector
         self._cfg = config
         self._logger = get_child_logger(logger, "order_mgr")
+
+        # Initialize WebSocket server
+        self._ws_server = WebSocketServer()
 
         # Strategy + supporting state
         mm_cfg = MarketMakerConfig(
@@ -88,6 +92,9 @@ class OrderManager:
         """Main entry point for the order manager."""
         symbol = self._cfg["trading"]["symbol"].upper()
         
+        # Start WebSocket server
+        await self._ws_server.start()
+        
         # Initialize exchange info and balances
         await self._initialize(symbol)
         
@@ -120,6 +127,7 @@ class OrderManager:
                 await fills_task
             except asyncio.CancelledError:
                 pass
+            await self._ws_server.stop()
 
     async def _initialize(self, symbol: str) -> None:
         """Initialize exchange info and balances."""
@@ -148,6 +156,12 @@ class OrderManager:
         self._latest_ob = OrderBook(ob_snapshot)
         self._last_ob_update = ob_snapshot.timestamp
         
+        # Send price update to frontend
+        await self._ws_server.broadcast({
+            'type': 'price',
+            'price': self._latest_ob.mid_price
+        })
+        
         # Initialize PnL tracker if we have valid orderbook and it's not initialized yet
         if self._pnl_tracker is None and self._latest_ob.best_bid and self._latest_ob.best_ask:
             base_balance = self._inv.available_balances["base"]
@@ -173,7 +187,6 @@ class OrderManager:
         if not self._live and not self._order_lock.locked():
             self._logger.info("No live orders detected, placing new grid orders")
             await self._place_grid_orders(symbol, self._latest_ob.mid_price)
-            return
         
         # Get strategy quotes
         band, bid_size, ask_size = await self._strat.quote(self._latest_ob)
@@ -464,6 +477,15 @@ class OrderManager:
                     "\n====================="
                 )
                 
+                # Send order updates to frontend
+                for order in self._live.values():
+                    await self._ws_server.broadcast({
+                        'type': 'order',
+                        'side': order.side,
+                        'price': order.price,
+                        'size': order.size
+                    })
+                
             except Exception as e:
                 self._logger.error("Failed to place grid orders: %s", e)
                 # Cancel any orders that might have been placed
@@ -671,6 +693,16 @@ class OrderManager:
             f"{pnl_info}\n"
             "==================="
         )
+
+        # Get PnL info if available
+        if self._pnl_tracker is not None:
+            # Send PnL update to frontend
+            await self._ws_server.broadcast({
+                'type': 'pnl',
+                'grid_pnl': self._pnl_tracker.grid_pnl,
+                'expo_pnl': self._pnl_tracker.expo_pnl,
+                'total_pnl': self._pnl_tracker.total_pnl
+            })
 
     def _report_fills(self) -> None:
         """Report fill statistics."""

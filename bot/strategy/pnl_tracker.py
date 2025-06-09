@@ -14,7 +14,7 @@ class OrderInfo:
 
 @dataclass
 class PnLTracker:
-    """Tracks both Total PnL and Pure grid-trading PnL with FIFO round-trip realization."""
+    """Tracks both Total PnL and Pure grid-trading PnL."""
     
     initial_mid_price: float
     initial_base_balance: float
@@ -40,15 +40,37 @@ class PnLTracker:
     
     def update_mid_price(self, new_mid_price: float) -> None:
         """Update PnL when mid price changes."""
-        # Calculate exposure PnL from price movement on current position
-        base_position = self.base_balance
-        self.expo_pnl = base_position * (new_mid_price - self.current_mid_price)
+        # Calculate drift since last update
+        price_drift = new_mid_price - self.current_mid_price
+        drift_pnl = self.base_balance * price_drift
+        
+        # Update exposure PnL with the new drift
+        self.expo_pnl += drift_pnl
+        
+        # Update current price
         self.current_mid_price = new_mid_price
-        # Update total PnL
-        self.total_pnl = self.grid_pnl + self.expo_pnl
+        
+        # Calculate current account value
+        current_value = self.account_equity
+        initial_value = self.initial_quote_balance + (self.initial_base_balance * self.initial_mid_price)
+        
+        # Calculate total PnL (change in account value)
+        self.total_pnl = current_value - initial_value
+        
+        # Grid PnL is what's left after subtracting exposure PnL
+        self.grid_pnl = self.total_pnl - self.expo_pnl
+        
+        self._logger.debug(
+            f"Updated PnL metrics:\n"
+            f"  Price drift: {price_drift:.2f}\n"
+            f"  Drift PnL: {drift_pnl:.2f}\n"
+            f"  Exposure PnL: {self.expo_pnl:.2f}\n"
+            f"  Grid PnL: {self.grid_pnl:.2f}\n"
+            f"  Total PnL: {self.total_pnl:.2f}"
+        )
     
     def register_order(self, order_id: str, side: str, size: float) -> None:
-        """Register a new order with its mid price."""
+        """Register a new order."""
         self._orders[order_id] = OrderInfo(
             side=side,
             size=size,
@@ -62,7 +84,7 @@ class PnLTracker:
         )
     
     def process_fill(self, order_id: str, fill_price: float, fee: float) -> None:
-        """Process a fill and update PnL metrics."""
+        """Process a fill by updating balances."""
         if order_id not in self._orders:
             raise ValueError(f"Order {order_id} not found in order tracking")
             
@@ -75,35 +97,35 @@ class PnLTracker:
             self.quote_balance -= (size * fill_price + fee)
             # Add to open positions
             self._open_positions.append((size, fill_price))
-            trade_pnl = 0  # No PnL realized on buy
         else:  # SELL
             self.base_balance -= size
             self.quote_balance += (size * fill_price - fee)
-            # Match against oldest open position (FIFO)
-            if self._open_positions:
+            # Match against open positions (FIFO)
+            remaining_size = size
+            while remaining_size > 0 and self._open_positions:
                 buy_size, buy_price = self._open_positions[0]
-                match_size = min(size, buy_size)
-                # Calculate realized PnL
-                trade_pnl = (fill_price - buy_price) * match_size - fee
+                match_size = min(remaining_size, buy_size)
+                # Calculate realized PnL for this match
+                self.expo_pnl += (fill_price - buy_price) * match_size
+                remaining_size -= match_size
                 # Update or remove the matched position
                 if match_size == buy_size:
                     self._open_positions.pop(0)
                 else:
                     self._open_positions[0] = (buy_size - match_size, buy_price)
-            else:
-                trade_pnl = 0  # No matching buy position
+            
+            # Subtract fee from total trade PnL
+            self.expo_pnl -= fee
         
-        self.grid_pnl += trade_pnl
-        self.total_pnl = self.grid_pnl + self.expo_pnl
-        del self._orders[order_id]  # Remove the filled order
+        # Update PnL metrics
+        self.update_mid_price(self.current_mid_price)
         
         self._logger.info(
-            f"Processed {order.side} fill:\n"
+            f"Processed fill:\n"
             f"  Order ID: {order_id}\n"
             f"  Size: {size:.6f}\n"
             f"  Fill Price: {fill_price:.2f}\n"
             f"  Fee: {fee:.6f}\n"
-            f"  Trade PnL: {trade_pnl:.2f}\n"
             f"  Grid PnL: {self.grid_pnl:.2f}\n"
             f"  Total PnL: {self.total_pnl:.2f}"
         )
